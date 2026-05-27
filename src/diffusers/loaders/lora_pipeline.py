@@ -43,6 +43,7 @@ from .lora_conversion_utils import (
     _convert_bfl_flux_control_lora_to_diffusers,
     _convert_fal_kontext_lora_to_diffusers,
     _convert_hunyuan_video_lora_to_diffusers,
+    _convert_kohya_anima_lora_to_diffusers,
     _convert_kohya_flux2_lora_to_diffusers,
     _convert_kohya_flux_lora_to_diffusers,
     _convert_musubi_wan_lora_to_diffusers,
@@ -5677,6 +5678,12 @@ class AnimaLoraLoaderMixin(LoraBaseMixin):
         has_diffusion_model = any(k.startswith("diffusion_model.") for k in state_dict)
         if has_diffusion_model:
             state_dict = _convert_non_diffusers_anima_lora_to_diffusers(state_dict)
+
+        # kohya-ss / sd-scripts (and the ComfyUI Anima LoRA trainer) save with `lora_unet_` /
+        # `lora_te_` prefixes and dots replaced by underscores. CivitAI Anima LoRAs use this format.
+        has_kohya_format = any(k.startswith(("lora_unet_", "lora_te_")) for k in state_dict)
+        if has_kohya_format:
+            state_dict = _convert_kohya_anima_lora_to_diffusers(state_dict)
 
         out = (state_dict, metadata) if return_lora_metadata else state_dict
         return out
