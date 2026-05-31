@@ -2317,50 +2317,271 @@ def _convert_non_diffusers_qwen_lora_to_diffusers(state_dict):
     return converted_state_dict
 
 
-def _convert_non_diffusers_anima_lora_to_diffusers(state_dict):
-    rename_dict = {
-        "blocks.": "transformer_blocks.",
-        "adaln_modulation_self_attn.1": "norm1.linear_1",
-        "adaln_modulation_self_attn.2": "norm1.linear_2",
-        "adaln_modulation_cross_attn.1": "norm2.linear_1",
-        "adaln_modulation_cross_attn.2": "norm2.linear_2",
-        "adaln_modulation_mlp.1": "norm3.linear_1",
-        "adaln_modulation_mlp.2": "norm3.linear_2",
-        "self_attn.q_proj": "attn1.to_q",
-        "self_attn.k_proj": "attn1.to_k",
-        "self_attn.v_proj": "attn1.to_v",
-        "self_attn.output_proj": "attn1.to_out.0",
-        "cross_attn.q_proj": "attn2.to_q",
-        "cross_attn.k_proj": "attn2.to_k",
-        "cross_attn.v_proj": "attn2.to_v",
-        "cross_attn.output_proj": "attn2.to_out.0",
-        "mlp.layer1": "ff.net.0.proj",
-        "mlp.layer2": "ff.net.2",
-        "final_layer.adaln_modulation.1": "norm_out.linear_1",
-        "final_layer.adaln_modulation.2": "norm_out.linear_2",
-        "final_layer.linear": "proj_out",
-        "t_embedder.1": "time_embed.t_embedder",
-        "t_embedding_norm": "time_embed.norm",
-        "x_embedder.proj.1": "patch_embed.proj",
-    }
+# Mapping from the original Anima DiT block sublayer name (with dots) to the diffusers
+# CosmosTransformerBlock sublayer name. Used by both `diffusion_model.`-prefixed and
+# kohya `lora_unet_`-prefixed converters.
+_ANIMA_DIT_BLOCK_RENAME = {
+    "adaln_modulation_self_attn.1": "norm1.linear_1",
+    "adaln_modulation_self_attn.2": "norm1.linear_2",
+    "adaln_modulation_cross_attn.1": "norm2.linear_1",
+    "adaln_modulation_cross_attn.2": "norm2.linear_2",
+    "adaln_modulation_mlp.1": "norm3.linear_1",
+    "adaln_modulation_mlp.2": "norm3.linear_2",
+    "self_attn.q_proj": "attn1.to_q",
+    "self_attn.k_proj": "attn1.to_k",
+    "self_attn.v_proj": "attn1.to_v",
+    "self_attn.output_proj": "attn1.to_out.0",
+    "cross_attn.q_proj": "attn2.to_q",
+    "cross_attn.k_proj": "attn2.to_k",
+    "cross_attn.v_proj": "attn2.to_v",
+    "cross_attn.output_proj": "attn2.to_out.0",
+    "mlp.layer1": "ff.net.0.proj",
+    "mlp.layer2": "ff.net.2",
+}
 
-    converted_state_dict = {}
-    for key, value in state_dict.items():
-        if not key.startswith("diffusion_model."):
-            converted_state_dict[key] = value
+# Non-block DiT modules under the `transformer.` namespace.
+_ANIMA_DIT_TOPLEVEL_RENAME = {
+    "final_layer.adaln_modulation.1": "norm_out.linear_1",
+    "final_layer.adaln_modulation.2": "norm_out.linear_2",
+    "final_layer.linear": "proj_out",
+    "t_embedder.1": "time_embed.t_embedder",
+    "t_embedding_norm": "time_embed.norm",
+    "x_embedder.proj.1": "patch_embed.proj",
+}
+
+
+def _pair_kohya_lora_keys(state_dict):
+    """Group kohya-style LoRA state dict keys by base name.
+
+    Returns ``(bases, leftover_keys)`` where ``bases`` is a dict mapping each base key (without
+    suffix) to ``{"down": tensor, "up": tensor, "alpha": tensor | None, "is_peft_style": bool}``
+    and ``leftover_keys`` is the list of keys that did not match any known LoRA suffix.
+    """
+    kohya_suffixes = (".lora_down.weight", ".lora_up.weight", ".alpha")
+    peft_suffixes = (".lora_A.weight", ".lora_B.weight")
+
+    bases = {}
+    leftover = []
+    for key in state_dict:
+        matched = False
+        for suffix in kohya_suffixes:
+            if key.endswith(suffix):
+                base = key[: -len(suffix)]
+                bucket = bases.setdefault(base, {"down": None, "up": None, "alpha": None, "is_peft_style": False})
+                if suffix == ".lora_down.weight":
+                    bucket["down"] = state_dict[key]
+                elif suffix == ".lora_up.weight":
+                    bucket["up"] = state_dict[key]
+                else:
+                    bucket["alpha"] = state_dict[key]
+                matched = True
+                break
+        if matched:
             continue
+        for suffix in peft_suffixes:
+            if key.endswith(suffix):
+                base = key[: -len(suffix)]
+                bucket = bases.setdefault(base, {"down": None, "up": None, "alpha": None, "is_peft_style": True})
+                if suffix == ".lora_A.weight":
+                    bucket["down"] = state_dict[key]
+                else:
+                    bucket["up"] = state_dict[key]
+                bucket["is_peft_style"] = True
+                matched = True
+                break
+        if not matched:
+            leftover.append(key)
 
-        new_key = key.removeprefix("diffusion_model.")
-        if new_key.startswith("llm_adapter."):
-            new_key = f"text_conditioner.{new_key.removeprefix('llm_adapter.')}"
+    return bases, leftover
+
+
+def _emit_diffusers_lora_pair(diffusers_base, bucket):
+    """Apply alpha-scaling for kohya-style buckets and return ``(lora_A_key, lora_A_val, lora_B_key, lora_B_val)``."""
+    down = bucket["down"]
+    up = bucket["up"]
+    alpha = bucket["alpha"]
+
+    if alpha is not None and not bucket["is_peft_style"]:
+        rank = down.shape[0]
+        alpha_val = alpha.item() if hasattr(alpha, "item") else float(alpha)
+        scale = alpha_val / rank
+        scale_down = scale
+        scale_up = 1.0
+        # Distribute the scale across down and up to limit float overflow when alpha >> rank.
+        while scale_down * 2 < scale_up:
+            scale_down *= 2
+            scale_up /= 2
+        down = down * scale_down
+        up = up * scale_up
+
+    return f"{diffusers_base}.lora_A.weight", down, f"{diffusers_base}.lora_B.weight", up
+
+
+def _convert_non_diffusers_anima_lora_to_diffusers(state_dict):
+    """Convert an Anima LoRA stored under the ``diffusion_model.`` prefix to diffusers format.
+
+    Supports both peft (``lora_A``/``lora_B``) and kohya (``lora_down``/``lora_up``/``alpha``) suffix
+    styles. DiT keys land under ``transformer.``; ``llm_adapter.`` keys land under
+    ``text_conditioner.`` (its sublayer names already match the diffusers
+    `AnimaTextConditioner`).
+    """
+    rename_dict = {"blocks.": "transformer_blocks.", **_ANIMA_DIT_BLOCK_RENAME, **_ANIMA_DIT_TOPLEVEL_RENAME}
+    prefix = "diffusion_model."
+
+    diffusion_model_state_dict = {k: v for k, v in state_dict.items() if k.startswith(prefix)}
+    passthrough_state_dict = {k: v for k, v in state_dict.items() if not k.startswith(prefix)}
+
+    bases, leftover = _pair_kohya_lora_keys(diffusion_model_state_dict)
+    if leftover:
+        logger.warning(
+            f"Ignoring {len(leftover)} `diffusion_model.`-prefixed keys without a recognised LoRA "
+            f"suffix (e.g. {leftover[0]!r})."
+        )
+
+    converted_state_dict = dict(passthrough_state_dict)
+    for base, bucket in bases.items():
+        unprefixed = base.removeprefix(prefix)
+        if unprefixed.startswith("llm_adapter."):
+            diffusers_base = f"text_conditioner.{unprefixed.removeprefix('llm_adapter.')}"
         else:
-            for old_key, new_key_part in rename_dict.items():
-                new_key = new_key.replace(old_key, new_key_part)
-            new_key = f"transformer.{new_key}"
+            renamed = unprefixed
+            for old, new in rename_dict.items():
+                renamed = renamed.replace(old, new)
+            diffusers_base = f"transformer.{renamed}"
 
-        converted_state_dict[new_key] = value
+        a_key, a_val, b_key, b_val = _emit_diffusers_lora_pair(diffusers_base, bucket)
+        converted_state_dict[a_key] = a_val
+        converted_state_dict[b_key] = b_val
 
     return converted_state_dict
+
+
+def _convert_kohya_anima_lora_to_diffusers(state_dict):
+    """Convert a kohya-ss / sd-scripts Anima LoRA to diffusers format.
+
+    Source layout (``networks/lora_anima.py`` in kohya-ss/sd-scripts, also written by CivitAI
+    trainers and the ComfyUI Anima LoRA trainer):
+
+    * DiT and optional LLM adapter weights are prefixed with ``lora_unet_``.
+    * Qwen3 text-encoder weights are prefixed with ``lora_te_``; the diffusers Anima loader does
+      not load LoRAs into the Qwen3 text encoder, so those are skipped with a warning.
+    * Dots in the original PyTorch module path are replaced with underscores, e.g.
+      ``blocks.0.self_attn.q_proj`` becomes ``lora_unet_blocks_0_self_attn_q_proj``.
+    * Weight suffixes are ``.lora_down.weight``, ``.lora_up.weight`` and (optionally) ``.alpha``.
+
+    Output is in diffusers/peft format: ``transformer.<diffusers_path>.lora_{A,B}.weight`` for the
+    DiT, and ``text_conditioner.<original_path>.lora_{A,B}.weight`` for the LLM adapter (whose
+    sublayer names match the diffusers `AnimaTextConditioner`).
+    """
+    # DiT block sub-module → diffusers path (under `transformer_blocks.{idx}.`).
+    # Keys are the kohya "underscored" form of the original module path.
+    dit_block_map = {k.replace(".", "_"): v for k, v in _ANIMA_DIT_BLOCK_RENAME.items()}
+
+    # DiT top-level Linear leaves (under `transformer.`).
+    # `_ANIMA_DIT_TOPLEVEL_RENAME` uses prefix substitution for the original dotted format,
+    # but the kohya munged form requires exact leaf matches because the underscore
+    # encoding is ambiguous. CosmosTimestepEmbedding holds two Linear leaves
+    # (`linear_1`, `linear_2`), so each gets an explicit entry here.
+    dit_top_map = {
+        "x_embedder_proj_1": "patch_embed.proj",
+        "t_embedder_1_linear_1": "time_embed.t_embedder.linear_1",
+        "t_embedder_1_linear_2": "time_embed.t_embedder.linear_2",
+        "final_layer_adaln_modulation_1": "norm_out.linear_1",
+        "final_layer_adaln_modulation_2": "norm_out.linear_2",
+        "final_layer_linear": "proj_out",
+    }
+
+    # LLM adapter sub-module: diffusers AnimaTextConditioner uses the same names as upstream.
+    # The attention output is `o_proj` (not the DiT's `output_proj`).
+    llm_block_map = {
+        "self_attn_q_proj": "self_attn.q_proj",
+        "self_attn_k_proj": "self_attn.k_proj",
+        "self_attn_v_proj": "self_attn.v_proj",
+        "self_attn_o_proj": "self_attn.o_proj",
+        "cross_attn_q_proj": "cross_attn.q_proj",
+        "cross_attn_k_proj": "cross_attn.k_proj",
+        "cross_attn_v_proj": "cross_attn.v_proj",
+        "cross_attn_o_proj": "cross_attn.o_proj",
+        "mlp_0": "mlp.0",
+        "mlp_2": "mlp.2",
+    }
+    llm_top_map = {"in_proj": "in_proj", "out_proj": "out_proj"}
+
+    block_re = re.compile(r"^blocks_(\d+)_(.+)$")
+    llm_block_re = re.compile(r"^llm_adapter_blocks_(\d+)_(.+)$")
+    llm_top_re = re.compile(r"^llm_adapter_(.+)$")
+
+    def map_kohya_module(name):
+        """Return ``(diffusers_base, kind)``: kind is "ok", "te" (skip), or "unknown"."""
+        if name.startswith("lora_te_"):
+            return None, "te"
+        if not name.startswith("lora_unet_"):
+            return None, "unknown"
+        rest = name[len("lora_unet_") :]
+
+        m = llm_block_re.match(rest)
+        if m:
+            idx, sub = m.group(1), m.group(2)
+            mapped = llm_block_map.get(sub)
+            return (f"text_conditioner.blocks.{idx}.{mapped}", "ok") if mapped else (None, "unknown")
+
+        m = llm_top_re.match(rest)
+        if m:
+            top = m.group(1)
+            mapped = llm_top_map.get(top)
+            return (f"text_conditioner.{mapped}", "ok") if mapped else (None, "unknown")
+
+        m = block_re.match(rest)
+        if m:
+            idx, sub = m.group(1), m.group(2)
+            mapped = dit_block_map.get(sub)
+            return (f"transformer.transformer_blocks.{idx}.{mapped}", "ok") if mapped else (None, "unknown")
+
+        mapped = dit_top_map.get(rest)
+        return (f"transformer.{mapped}", "ok") if mapped else (None, "unknown")
+
+    # Separate kohya / already-diffusers / unhandled keys.
+    kohya_state_dict = {}
+    passthrough = {}
+    for key, value in state_dict.items():
+        if key.startswith(("lora_unet_", "lora_te_")):
+            kohya_state_dict[key] = value
+        else:
+            passthrough[key] = value
+
+    bases, leftover_kohya = _pair_kohya_lora_keys(kohya_state_dict)
+
+    converted = dict(passthrough)
+    skipped_te = []
+    unknown = list(leftover_kohya)
+
+    for base, bucket in bases.items():
+        diffusers_base, kind = map_kohya_module(base)
+        if kind == "te":
+            skipped_te.append(base)
+            continue
+        if kind != "ok":
+            unknown.append(base)
+            continue
+        if bucket["down"] is None or bucket["up"] is None:
+            unknown.append(base)
+            continue
+        a_key, a_val, b_key, b_val = _emit_diffusers_lora_pair(diffusers_base, bucket)
+        converted[a_key] = a_val
+        converted[b_key] = b_val
+
+    if skipped_te:
+        logger.warning(
+            f"Skipping {len(skipped_te)} Qwen3 text-encoder LoRA keys (e.g. {skipped_te[0]!r}). "
+            "The Anima LoRA loader only supports the DiT transformer and text conditioner."
+        )
+    if unknown:
+        logger.warning(
+            f"Skipping {len(unknown)} kohya Anima LoRA keys with an unrecognised module path "
+            f"(e.g. {unknown[0]!r})."
+        )
+
+    return converted
 
 
 def _convert_non_diffusers_flux2_lora_to_diffusers(state_dict):

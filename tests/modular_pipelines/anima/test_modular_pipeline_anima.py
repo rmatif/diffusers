@@ -229,3 +229,70 @@ class TestAnimaModularPipelineFast(ModularPipelineTesterMixin, ModularGuiderTest
 
         assert "dummy" in pipe.transformer.peft_config
         assert "dummy" in pipe.text_conditioner.peft_config
+
+    def test_kohya_lora_state_dict_conversion(self):
+        # kohya-ss / sd-scripts / CivitAI Anima LoRA format: `lora_unet_` prefix, dots replaced
+        # with underscores in module paths, kohya `.lora_down`/`.lora_up`/`.alpha` suffixes.
+        rank = 2
+        alpha = 4.0  # scale = alpha / rank = 2.0
+        state_dict = {
+            # DiT self-attn QKV + output
+            "lora_unet_blocks_0_self_attn_q_proj.lora_down.weight": torch.ones(rank, 32),
+            "lora_unet_blocks_0_self_attn_q_proj.lora_up.weight": torch.ones(32, rank),
+            "lora_unet_blocks_0_self_attn_q_proj.alpha": torch.tensor(alpha),
+            "lora_unet_blocks_0_self_attn_output_proj.lora_down.weight": torch.randn(rank, 32),
+            "lora_unet_blocks_0_self_attn_output_proj.lora_up.weight": torch.randn(32, rank),
+            # DiT cross-attn + MLP + adaLN
+            "lora_unet_blocks_0_cross_attn_k_proj.lora_down.weight": torch.randn(rank, 16),
+            "lora_unet_blocks_0_cross_attn_k_proj.lora_up.weight": torch.randn(32, rank),
+            "lora_unet_blocks_0_mlp_layer1.lora_down.weight": torch.randn(rank, 32),
+            "lora_unet_blocks_0_mlp_layer1.lora_up.weight": torch.randn(64, rank),
+            "lora_unet_blocks_0_adaln_modulation_cross_attn_2.lora_down.weight": torch.randn(rank, 4),
+            "lora_unet_blocks_0_adaln_modulation_cross_attn_2.lora_up.weight": torch.randn(64, rank),
+            # LLM adapter (text_conditioner). Note `o_proj` rather than DiT's `output_proj`.
+            "lora_unet_llm_adapter_blocks_0_self_attn_q_proj.lora_down.weight": torch.randn(rank, 16),
+            "lora_unet_llm_adapter_blocks_0_self_attn_q_proj.lora_up.weight": torch.randn(16, rank),
+            "lora_unet_llm_adapter_blocks_0_self_attn_o_proj.lora_down.weight": torch.randn(rank, 16),
+            "lora_unet_llm_adapter_blocks_0_self_attn_o_proj.lora_up.weight": torch.randn(16, rank),
+            # Qwen3 text encoder keys — skipped because the Anima loader does not load them.
+            "lora_te_layers_0_self_attn_q_proj.lora_down.weight": torch.randn(rank, 16),
+            "lora_te_layers_0_self_attn_q_proj.lora_up.weight": torch.randn(16, rank),
+        }
+
+        converted = self.pipeline_class.lora_state_dict(state_dict)
+
+        # DiT keys land under `transformer.` with diffusers naming.
+        assert "transformer.transformer_blocks.0.attn1.to_q.lora_A.weight" in converted
+        assert "transformer.transformer_blocks.0.attn1.to_q.lora_B.weight" in converted
+        assert "transformer.transformer_blocks.0.attn1.to_out.0.lora_A.weight" in converted
+        assert "transformer.transformer_blocks.0.attn2.to_k.lora_A.weight" in converted
+        assert "transformer.transformer_blocks.0.ff.net.0.proj.lora_A.weight" in converted
+        assert "transformer.transformer_blocks.0.norm2.linear_2.lora_A.weight" in converted
+
+        # LLM adapter keys land under `text_conditioner.` preserving `o_proj`.
+        assert "text_conditioner.blocks.0.self_attn.q_proj.lora_A.weight" in converted
+        assert "text_conditioner.blocks.0.self_attn.o_proj.lora_A.weight" in converted
+
+        # Qwen3 text encoder keys are skipped.
+        assert not any("text_encoder" in k or k.startswith("lora_te_") for k in converted)
+
+        # Alpha scaling: the q_proj A weights were all ones, scaled by alpha/rank = 2.0.
+        scaled = converted["transformer.transformer_blocks.0.attn1.to_q.lora_A.weight"]
+        assert torch.allclose(scaled, torch.full_like(scaled, 2.0))
+
+    @require_peft_backend
+    def test_load_lora_weights_kohya_format(self):
+        pipe = self.get_pipeline()
+        rank = 2
+        state_dict = {
+            "lora_unet_blocks_0_self_attn_q_proj.lora_down.weight": torch.randn(rank, 32),
+            "lora_unet_blocks_0_self_attn_q_proj.lora_up.weight": torch.randn(32, rank),
+            "lora_unet_blocks_0_self_attn_q_proj.alpha": torch.tensor(float(rank)),
+            "lora_unet_llm_adapter_blocks_0_self_attn_q_proj.lora_down.weight": torch.randn(rank, 16),
+            "lora_unet_llm_adapter_blocks_0_self_attn_q_proj.lora_up.weight": torch.randn(16, rank),
+        }
+
+        pipe.load_lora_weights(state_dict, adapter_name="kohya")
+
+        assert "kohya" in pipe.transformer.peft_config
+        assert "kohya" in pipe.text_conditioner.peft_config
